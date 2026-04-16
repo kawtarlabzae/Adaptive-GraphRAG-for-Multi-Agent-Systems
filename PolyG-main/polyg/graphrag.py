@@ -1,0 +1,460 @@
+import asyncio
+import os
+import tiktoken
+import time
+import json
+import transformers
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Dict, List, Optional, Type, Union, cast, Tuple
+from .prompt import PROMPTS, SCHEMA_MAP
+from .utils import num_tokens
+from .op import retrieve_and_generate
+from .utils import limit_async_func_call, always_get_an_event_loop, logger
+from .storage import Neo4jStorage
+from .base import BaseGraphStorage, QueryParam
+from .llm import LLM
+from .retriever import *
+
+
+@dataclass
+class GraphRAG:
+    dataset: str
+    working_dir: str | None = None
+
+    # LLM
+    model: str = "openai/gpt-4o"
+    model_max_token_size: int = 32768
+    model_sampling_params: Dict = field(default_factory=dict)
+    model_max_async: int = 16
+    llm: LLM = field(init=False)
+    model_func: Callable = field(init=False)
+    token_encoder: tiktoken.Encoding | transformers.PreTrainedTokenizer = field(
+        init=False
+    )
+
+    # graph schema
+    concrete_graph_schema: str = "null"
+
+    # storage
+    graph_storage_cls: Type[BaseGraphStorage] = Neo4jStorage
+
+    # extension
+    create_working_dir: bool = False
+    addon_params: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.working_dir and self.create_working_dir:
+            logger.info(f"Creating working directory {self.working_dir}")
+            os.makedirs(self.working_dir, exist_ok=True)
+
+        self.llm = LLM(self.model, self.model_sampling_params)
+        self.model_func = limit_async_func_call(self.model_max_async)(self.llm.generate)
+        self.token_encoder = self.llm.token_encoder
+
+        self.entity_relation_graph = self.graph_storage_cls(
+            namespace="", global_config=asdict(self)
+        )
+
+        self.traversal_functions = {
+            "cypher_query": guided_walk_retriever,
+            "cypher_path_search": topk_csp_retriever,
+            "BFS": bfs_retriever,
+            "topk_shortest_paths": shortest_path_retriever,
+            "cypher_only": cypher_only_retriever,
+            "BFS+PPR": bfs_ppr_retriever,
+        }
+
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self).items()])
+        logger.debug(f"GraphRAG init with param:\n\n  {_print_config}\n")
+
+    def register_retriever(self, name: str, func: Callable) -> None:
+        """
+        Register a custom retriever function.
+        """
+        self.traversal_functions[name] = func
+        logger.info(f"Registered custom retriever: {name}")
+
+    # ── Entity Linking ─────────────────────────────────────────────────────────
+
+    async def extract_entity_ids(self, question: str) -> Dict[str, str]:
+        """
+        Entity Resolution: given a raw natural-language question, return an
+        id_mapping {entity_name: graph_id} ready to pass into aquery().
+
+        Two-step pipeline
+        -----------------
+        Step 1 — Entity Extraction (LLM)
+            Ask the LLM to identify every real-world entity mentioned in the
+            question (people, papers, venues, organisations, etc.) and return
+            them as a JSON list.  No graph knowledge is required here.
+
+        Step 2 — Entity Linking (Neo4j fuzzy name search)
+            For each extracted entity name, run a case-insensitive CONTAINS
+            search against the graph.  Return the best hit (highest degree
+            node when there are multiple candidates).
+
+        Returns an empty dict if no entities can be resolved.
+        """
+        import json as _json
+        import re as _re
+
+        # ── Step 1: extract entity mentions with the LLM ──────────────────────
+        extraction_prompt = (
+            "You are an entity extractor.  Given the question below, list every "
+            "real-world named entity (person, paper title, venue, organisation, "
+            "concept) that appears in it.  Return ONLY a JSON array of strings, "
+            "one entry per entity.  No explanation.\n\n"
+            f"Question: {question}\n\n"
+            "Answer (JSON array only):"
+        )
+        try:
+            raw = await self.model_func(prompt=extraction_prompt)
+            # parse the JSON array from the LLM response
+            m = _re.search(r"\[.*?\]", raw, _re.DOTALL)
+            entity_names: List[str] = _json.loads(m.group()) if m else []
+        except Exception as e:
+            logger.warning(f"Entity extraction failed: {e}")
+            return {}
+
+        if not entity_names:
+            return {}
+
+        logger.info(f"Extracted entity mentions: {entity_names}")
+
+        # ── Step 2: link each mention to a graph node via fuzzy name search ───
+        namespace = self.dataset
+        id_mapping: Dict[str, str] = {}
+
+        for mention in entity_names:
+            safe = mention.replace("'", "\\'")
+            # Primary: exact CONTAINS match on name
+            cypher = (
+                f"MATCH (n:{namespace}) "
+                f"WHERE toLower(n.name) CONTAINS toLower('{safe}') "
+                f"RETURN n.id AS id, n.name AS name "
+                f"LIMIT 5"
+            )
+            try:
+                records = await self.entity_relation_graph.exec_query(cypher)
+            except Exception as e:
+                logger.warning(f"Entity linking query failed for '{mention}': {e}")
+                records = []
+
+            # Fallback: search on description if name search returned nothing
+            if not records:
+                cypher_desc = (
+                    f"MATCH (n:{namespace}) "
+                    f"WHERE toLower(n.description) CONTAINS toLower('{safe}') "
+                    f"RETURN n.id AS id, n.name AS name "
+                    f"LIMIT 5"
+                )
+                try:
+                    records = await self.entity_relation_graph.exec_query(cypher_desc)
+                except Exception:
+                    records = []
+
+            if not records:
+                logger.warning(f"No graph node found for entity mention: '{mention}'")
+                continue
+
+            # When multiple candidates exist, prefer the one whose name is the
+            # shortest (closest match) — a cheap proxy for specificity.
+            best = min(records, key=lambda r: len(r.get("name", "")))
+            id_mapping[best["name"]] = best["id"]
+            logger.info(f"  '{mention}' → '{best['name']}' (id={best['id']})")
+
+        return id_mapping
+
+    def resolve_entity_ids(self, question: str) -> Dict[str, str]:
+        """Synchronous wrapper around extract_entity_ids()."""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.extract_entity_ids(question))
+
+    def query(
+        self, query: str, id_mapping: dict, param: QueryParam = QueryParam()
+    ) -> tuple[str, float, int, int, List]:
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.aquery(query, id_mapping, param))
+
+    async def aquery(
+        self, query: str, id_mapping: dict, param: QueryParam = QueryParam()
+    ) -> tuple[str, float, int, int, List]:
+        assert param.mode == "local", "Only local mode is supported"
+
+        total_api_calls = 0
+        total_tokens = 0
+        global_traversal_type = param.traversal_type
+        global_question = query
+        start = time.time()
+
+        tic = time.time()
+        if global_traversal_type == "adaptive":
+            global_traversal_type, token_len = await self.determine_traversal_type(
+                query, param
+            )
+            total_api_calls += 1
+            total_tokens += token_len
+
+            if global_traversal_type is None:
+                logger.error("Failed to determine the traversal type")
+                return (
+                    PROMPTS["fail_response"],
+                    time.time() - start,
+                    total_api_calls,
+                    0,
+                    [],
+                )
+        print(f"Question classification time: {time.time() - tic:.2f}s")
+        print(f"Traversal type: {global_traversal_type}")
+
+        # ── DRIFT: route nested questions to DRIFT search ──────────────────────
+        if global_traversal_type == "nested":
+            from .retriever.drift_retriever import drift_search
+            logger.info("Routing nested question to DRIFT search")
+            (
+                response,
+                _drift_dur,
+                drift_tokens,
+                drift_calls,
+                answer_list,
+            ) = await drift_search(
+                query,
+                id_mapping,
+                self.entity_relation_graph,
+                self.model_func,
+                self.token_encoder,
+                param,
+                asdict(self),
+            )
+            total_tokens += drift_tokens
+            total_api_calls += drift_calls
+            print(f"Query time: {time.time() - start:.2f}s")
+            return response, time.time() - start, total_tokens, total_api_calls, answer_list
+        # ───────────────────────────────────────────────────────────────────────
+
+        query_plan_str, query_plan = None, None
+        steps = 1
+
+        history = []
+        response, answer_list = "N/A", []
+        for step in range(steps):
+            if global_traversal_type == "nested":
+                assert query_plan_str is not None and query_plan is not None
+                subqueries, traversal_type, token_len = await self.instantiate_query(
+                    global_question,
+                    query_plan_str,
+                    query_plan,
+                    step,
+                    history,
+                    id_mapping,
+                    param,
+                )
+                total_api_calls += 1
+                total_tokens += token_len
+
+                if subqueries is None:
+                    logger.warning("Failed to instance a concrete query, skip")
+                    continue
+            else:
+                traversal_type = global_traversal_type
+                subqueries = {
+                    "question1": {"question": global_question, "id_mapping": id_mapping}
+                }
+
+            param.traversal_type = traversal_type  # type: ignore
+            print(f"Step {step + 1}/{steps}, traversal_type: {traversal_type}")
+            print(f"Step {step + 1}/{steps}, history: {history}")
+            print(f"Step {step + 1}/{steps}, subqueries: {subqueries}")
+
+            for query_dict in subqueries.values():
+                subquery = query_dict["question"]
+                sub_id_mapping = query_dict["id_mapping"]
+                print(f"Subquery: {subquery}, id_mapping: {sub_id_mapping}")
+
+                if traversal_type in self.traversal_functions:
+                    retrieve_func = self.traversal_functions[traversal_type]
+                else:
+                    logger.error(f"Unsupported traversal type: {traversal_type}")
+                    return (
+                        PROMPTS["fail_response"],
+                        time.time() - start,
+                        total_tokens,
+                        total_api_calls,
+                        [],
+                    )
+
+                response, token_len, api_calls, answer_list = (
+                    await retrieve_and_generate(
+                        subquery,
+                        sub_id_mapping,
+                        self.entity_relation_graph,
+                        retrieve_func,
+                        param,
+                        asdict(self),
+                    )
+                )
+
+                total_api_calls += api_calls
+                total_tokens += token_len
+                id_mapping.update(sub_id_mapping)
+                history.append({"question": subquery, "response": response})
+
+        if global_traversal_type == "nested":
+            # combine the steps and generate a final summary to the global question
+            print("All history:", history)
+            prompt = PROMPTS["nested_query_summarization"].format(
+                question=global_question,
+                query_plan=query_plan_str,
+                history=history,
+            )
+            response = await self.model_func(prompt=prompt)
+            token_len = num_tokens(prompt, self.token_encoder)
+            total_api_calls += 1
+            total_tokens += token_len
+
+        duration = time.time() - start
+        print(f"Query time: {duration:.2f}s")
+        return response, duration, total_tokens, total_api_calls, answer_list
+
+    async def determine_traversal_type(
+        self, query: str, query_param: QueryParam
+    ) -> Tuple[str | None, int]:
+        """
+        Determine the traversal type based on the query by LLM.
+        """
+        traversal_types = [
+            "BFS",
+            "cypher_query",
+            "topk_shortest_paths",
+            "cypher_path_search",
+        ]
+        use_model_func = self.model_func
+        prompt = PROMPTS["question_classification"].format(query)
+
+        response = await use_model_func(prompt=prompt)
+        query_param.question_classification_result = response
+        token_len = num_tokens(prompt, self.token_encoder)
+        print(response)
+
+        try:
+            import re as _re
+            m = _re.search(r"-?\d+", response)
+            if not m:
+                raise ValueError(f"No integer found in classification response: {response!r}")
+            num = int(m.group())
+            if num != -1:
+                return traversal_types[num], token_len
+            else:
+                return "nested", token_len
+        except Exception as e:
+            logger.error(f"Error in determining traversal type: {e}")
+            return None, token_len
+
+    async def decompose_nested_query(
+        self, query: str, query_param: QueryParam
+    ) -> Tuple[str | None, List[Tuple[str, str]], int, int]:
+        """
+        Decompose the nested query into sub-queries.
+        """
+        graph_schema = SCHEMA_MAP[self.dataset]
+        if self.dataset in ["webqsp", "cwq"]:
+            graph_schema = graph_schema.format(
+                schema=self.concrete_graph_schema, benchmark=self.dataset, example=""
+            )
+        else:
+            graph_schema = graph_schema.format(dataset=self.dataset)
+
+        total_tokens = 0
+        history_msgs = []
+        prompt = PROMPTS["nested_query_decomposition"].format(
+            graph_schema=graph_schema, query=query
+        )
+        plan_str, plan = None, []
+        response = None
+        for i in range(query_param.failure_retries + 1):
+            try:
+                response = await self.model_func(
+                    prompt=prompt, history_messages=history_msgs
+                )
+                plan_str = response.split("```")[1].strip("plan").replace("\n\n", "\n")
+                plan = plan_str.strip("\n").split("\n")
+                for i, step in enumerate(plan):
+                    traversal = step.split(":")[0]
+                    description = step[len(traversal) + 1 :]
+                    plan[i] = (traversal.split(".")[1].strip(), description.strip())
+
+                total_tokens += num_tokens(prompt, self.token_encoder)
+                break
+            except Exception as e:
+                logger.error(f"Error in decomposing query: {e}")
+                history_msgs.extend(
+                    [
+                        ("user", prompt),
+                        ("assistant", response),
+                    ]
+                )
+                prompt = PROMPTS["error_retry"].format(str(e))
+        return plan_str, plan, len(plan), total_tokens
+
+    async def instantiate_query(
+        self,
+        global_query: str,
+        query_plan_str: str,
+        query_plan: List[Tuple[str, str]],
+        step: int,
+        history: List[str],
+        id_mapping: dict[str, str],
+        query_param: QueryParam,
+    ) -> Tuple[Dict[str, Dict] | None, str, int]:
+        """
+        Instantiate the query based on the query plan and step.
+        """
+        mapping = {
+            "<s,*,*>": "BFS",
+            "<s,p,*>": "cypher_query",
+            "<s,*,o>": "topk_shortest_paths",
+            "<s,p,o>": "cypher_path_search",
+        }
+        # extract the traversal type from the query plan
+        traversal_type = mapping[query_plan[step][0]]
+
+        history_str = ""
+        for i, h in enumerate(history):
+            history_str += f"Response for step {i + 1}: {h}\n"
+
+        total_tokens = 0
+        history_msgs = []
+        prompt = PROMPTS["nested_query_instantiation"].format(
+            question=global_query,
+            query_plan=query_plan_str,
+            step=step + 1,
+            history=history_str,
+            mapping=id_mapping,
+        )
+        response, concrete_queries = None, None
+        for i in range(query_param.failure_retries + 1):
+            try:
+                response = await self.model_func(
+                    prompt=prompt, history_messages=history_msgs
+                )
+
+                q_str = response.split("```")[1].strip("json")
+                concrete_queries = json.loads(q_str)
+                for k, v in concrete_queries.items():
+                    if isinstance(v["id_mapping"], str):
+                        new_map = v["id_mapping"].replace("'", '"')
+                        concrete_queries[k]["id_mapping"] = json.loads(new_map)
+
+                total_tokens += num_tokens(prompt, self.token_encoder)
+                break
+            except Exception as e:
+                logger.error(f"Error in instantiating query: {e}")
+                history_msgs.extend(
+                    [
+                        ("user", prompt),
+                        ("assistant", response),
+                    ]
+                )
+                prompt = PROMPTS["error_retry"].format(str(e))
+
+        return concrete_queries, traversal_type, total_tokens

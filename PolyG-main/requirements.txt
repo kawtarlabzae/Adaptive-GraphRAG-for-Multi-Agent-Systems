@@ -1,0 +1,22 @@
+future>=1.0.0
+openai
+tiktoken
+litellm
+python-dotenv
+transformers
+networkx
+graspologic
+nano-vectordb
+hnswlib
+xxhash
+tenacity
+dspy-ai
+neo4j
+aioboto3
+jsonlines
+sentence-transformers
+igraph
+datasets
+protobuf
+scipy
+# vllm==0.11.0  # Linux-only; only needed if using hosted_vllm/ models with a vLLM server
